@@ -1,0 +1,9 @@
+.env
+.venv/
+venv/
+descargas/
+consolidado_*.xlsx
+__pycache__/
+*.pyc
+.pytest_cache/
+debug_login.png
