@@ -22,16 +22,19 @@ def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
         page = ctx.new_page()
         page.goto(config.URL_LOGIN, wait_until="networkidle")
 
-        # En una página de login el campo password suele ser único.
-        page.fill("input[type=password]", clave)
-        # El usuario es el primer input de texto visible.
-        page.fill("input[type=text]:visible", usuario)
-        # Enviar: Enter dispara el JS de cifrado y el postback.
-        page.press("input[type=password]", "Enter")
-        page.wait_for_load_state("networkidle")
+        # Campos visibles del login (ids estáticos del portal). Hay que ESCRIBIR
+        # carácter por carácter: el JS del sitio cifra los valores en handlers de
+        # teclado, así que un fill() directo no los dispara y el login falla.
+        page.locator("#TxbUsuario").press_sequentially(usuario, delay=30)
+        page.locator("#TxbClave").press_sequentially(clave, delay=30)
+        page.locator("#TxbClave").blur()
+        # El botón Ingresar dispara el cifrado JS y el postback.
+        page.click("#BtnIngresar")
 
-        # Ir a una página autenticada que expone el campo oculto 'ticket'.
-        page.goto(config.URL_AGRUPADO, wait_until="networkidle")
+        # Tras autenticar, el portal redirige fuera de LoginDesk; el campo oculto
+        # 'ticket' queda disponible en la página de inicio.
+        page.wait_for_url(lambda u: "LoginDesk" not in u, timeout=30000)
+        page.wait_for_load_state("networkidle")
         if debug:
             page.screenshot(path="debug_login.png")
 

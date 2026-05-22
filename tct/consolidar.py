@@ -10,7 +10,10 @@ def consolidar(rutas_xlsx: list[str], ruta_salida: str) -> int:
     for ruta in rutas_xlsx:
         df = pd.read_excel(ruta)
         patente = os.path.splitext(os.path.basename(ruta))[0]
-        df.insert(0, "Patente", patente)
+        # El xlsx exportado puede traer ya su propia columna "Patente"; solo la
+        # agregamos (al frente) si no existe, para no duplicarla.
+        if "Patente" not in df.columns:
+            df.insert(0, "Patente", patente)
         marcos.append(df)
     if not marcos:
         raise ValueError("No hay archivos para consolidar.")
