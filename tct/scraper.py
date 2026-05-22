@@ -3,9 +3,11 @@
 El login (cifrado con JS) lo resuelve tct.login con Playwright; aquí solo se
 reutilizan las cookies + ticket de esa sesión para bajar los .xlsx.
 """
+import io
 import os
 from datetime import datetime
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -98,6 +100,16 @@ def descargar_patente(sesion, ticket, patente, desde, hasta, glosa_prod="Diésel
     r2 = sesion.post(URL_DETALLE, data=payload, headers=headers, timeout=60)
     r2.raise_for_status()
     return r2.content
+
+
+def descargar_patente_df(sesion, ticket, patente, desde, hasta, glosa_prod="Diésel"):
+    """Como descargar_patente pero devuelve un DataFrame con el detalle.
+    DataFrame vacío si la patente no tiene transacciones en el rango."""
+    contenido = descargar_patente(sesion, ticket, patente, desde, hasta, glosa_prod)
+    try:
+        return pd.read_excel(io.BytesIO(contenido))
+    except ValueError:
+        return pd.DataFrame()
 
 
 def guardar_xlsx(contenido: bytes, patente: str, carpeta: str) -> str:

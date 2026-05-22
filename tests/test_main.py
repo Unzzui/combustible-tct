@@ -15,3 +15,8 @@ def test_parse_args_defaults_rango_y_flota():
     assert args.hasta == date.today().isoformat()
     assert args.flota == "data/Flota.xlsx"
     assert args.patentes is None
+    assert args.rehacer is False
+
+
+def test_parse_args_rehacer():
+    assert main.parse_args(["--rehacer"]).rehacer is True
