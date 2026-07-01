@@ -3,7 +3,8 @@
 venv/
 descargas/
 consolidado_*.xlsx
-data/consolidado.parquet
+# data/consolidado.parquet — se versiona para servir de semilla en despliegues
+# nuevos (evita bajar el histórico completo desde 2024 en el primer run).
 data/consolidado.xlsx
 __pycache__/
 *.pyc
