@@ -14,6 +14,13 @@ FLOTA_POR_DEFECTO = "data/Flota.xlsx"
 PARQUET = "data/consolidado.parquet"
 XLSX = "data/consolidado.xlsx"
 
+PATO_XLSX = "data/camionetas_division/camionetas_proyectos_pato.xlsx"
+PATO_CARPETA = "data/camionetas_division"
+PATO_PARQUET = "data/camionetas_division/consolidado_pato.parquet"
+PATO_XLSX_OUT = "data/camionetas_division/consolidado_pato.xlsx"
+PATO_HOJA = "BD"
+PATO_COL_OT = "OT"
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
@@ -26,12 +33,18 @@ def parse_args(argv=None):
                    help="Excel de flota con columna 'Patente' (def: data/Flota.xlsx)")
     p.add_argument("--patentes", default=None,
                    help="Alternativa: archivo .txt con una patente por línea")
+    p.add_argument("--pato", action="store_true",
+                   help="Usa el Excel de camionetas de proyectos PATO y guarda en data/camionetas_division/")
     p.add_argument("--rehacer", action="store_true",
                    help="Ignora el maestro y reconstruye todo desde --desde")
     return p.parse_args(argv)
 
 
 def cargar_lista(args):
+    if args.pato:
+        if not os.path.exists(PATO_XLSX):
+            raise SystemExit(f"No existe {PATO_XLSX}.")
+        return config.cargar_patentes_flota(PATO_XLSX, hoja=PATO_HOJA)
     if args.patentes:
         return config.cargar_patentes(args.patentes)
     if not os.path.exists(args.flota):
@@ -45,7 +58,16 @@ def main(argv=None):
     if not patentes:
         raise SystemExit("No hay patentes para procesar.")
 
-    maestro = None if args.rehacer else almacen.leer_maestro(PARQUET)
+    carpeta_salida = PATO_CARPETA if args.pato else CARPETA_SALIDA
+    parquet_path = PATO_PARQUET if args.pato else PARQUET
+    xlsx_path = PATO_XLSX_OUT if args.pato else XLSX
+
+    mapa_ot = (
+        config.cargar_mapa_patente_ot(PATO_XLSX, col_ot=PATO_COL_OT, hoja=PATO_HOJA)
+        if args.pato else None
+    )
+
+    maestro = None if args.rehacer else almacen.leer_maestro(parquet_path)
     filas_previas = 0 if maestro is None else len(maestro)
     log.info("Patentes: %d | maestro previo: %d filas | hasta: %s",
              len(patentes), filas_previas, args.hasta)
@@ -72,12 +94,20 @@ def main(argv=None):
     if total.empty:
         raise SystemExit("No hay datos para guardar.")
 
-    os.makedirs(CARPETA_SALIDA, exist_ok=True)
-    almacen.guardar(total, PARQUET, XLSX)
+    if mapa_ot and almacen.COL_PATENTE in total.columns:
+        total["OT"] = total[almacen.COL_PATENTE].map(
+            lambda v: mapa_ot.get(config.normalizar_patente(v), "")
+        )
+        cols = list(total.columns)
+        cols.insert(0, cols.pop(cols.index("OT")))
+        total = total[cols]
+
+    os.makedirs(carpeta_salida, exist_ok=True)
+    almacen.guardar(total, parquet_path, xlsx_path)
     agregadas = len(total) - filas_previas
     log.info("Maestro: %s (%d filas, +%d nuevas, %d fallidas)",
-             PARQUET, len(total), agregadas, len(fallidas))
-    log.info("Copia Excel: %s", XLSX)
+             parquet_path, len(total), agregadas, len(fallidas))
+    log.info("Copia Excel: %s", xlsx_path)
     if fallidas:
         log.warning("Patentes con error: %s", ", ".join(fallidas))
 

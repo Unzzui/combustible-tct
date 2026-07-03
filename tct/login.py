@@ -20,20 +20,35 @@ def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
         navegador = p.chromium.launch(headless=headless)
         ctx = navegador.new_context()
         page = ctx.new_page()
-        page.goto(config.URL_LOGIN, wait_until="networkidle")
+        page.goto(config.URL_LOGIN, wait_until="load")
 
         # Campos visibles del login (ids estáticos del portal). Hay que ESCRIBIR
         # carácter por carácter: el JS del sitio cifra los valores en handlers de
         # teclado, así que un fill() directo no los dispara y el login falla.
+        try:
+            page.locator("#TxbUsuario").wait_for(state="visible", timeout=30000)
+        except Exception:
+            page.screenshot(path="debug_login_fail.png", full_page=True)
+            with open("debug_login_fail.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            raise RuntimeError(
+                f"No apareció #TxbUsuario. URL actual: {page.url} | título: {page.title()!r}. "
+                "Revisá debug_login_fail.png y debug_login_fail.html."
+            )
         page.locator("#TxbUsuario").press_sequentially(usuario, delay=30)
         page.locator("#TxbClave").press_sequentially(clave, delay=30)
         page.locator("#TxbClave").blur()
         # El botón Ingresar dispara el cifrado JS y el postback.
         page.click("#BtnIngresar")
 
-        # Tras autenticar, el portal redirige fuera de LoginDesk; el campo oculto
-        # 'ticket' queda disponible en la página de inicio.
-        page.wait_for_url(lambda u: "LoginDesk" not in u, timeout=30000)
+        # Tras autenticar, el portal redirige a la página de inicio y rellena el
+        # input oculto 'ticket'. Esperamos a que ese campo tenga valor (vía JS),
+        # que es la señal más confiable de que la sesión quedó establecida.
+        page.wait_for_function(
+            "() => { const t = document.querySelector('input[name=ticket]'); "
+            "return t && t.value && t.value.length > 20; }",
+            timeout=30000,
+        )
         page.wait_for_load_state("networkidle")
         if debug:
             page.screenshot(path="debug_login.png")
