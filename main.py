@@ -1,8 +1,9 @@
 import argparse
+import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from tct import config, login, scraper, almacen
 
@@ -20,6 +21,53 @@ PATO_PARQUET = "data/camionetas_division/consolidado_pato.parquet"
 PATO_XLSX_OUT = "data/camionetas_division/consolidado_pato.xlsx"
 PATO_HOJA = "BD"
 PATO_COL_OT = "OT"
+
+# Circuit breaker: cuando el portal bloquea, escribimos un flag con TTL para
+# saltear las próximas corridas hasta que expire. Evita amplificar el bloqueo
+# con reintentos automáticos del orquestador (schedule 06:00 y 18:00).
+CB_FILENAME = ".circuit_breaker.json"
+CB_TTL_HOURS = int(os.getenv("TCT_BLOCK_TTL_HOURS", "6"))
+
+
+def _cb_path(carpeta: str) -> str:
+    return os.path.join(carpeta, CB_FILENAME)
+
+
+def _cb_activo(path: str):
+    """Devuelve el dict del circuit breaker si aún está vigente; None si no
+    existe, está corrupto o ya expiró (en esos casos borra el archivo)."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        until = datetime.fromisoformat(data["blocked_until"])
+    except Exception:
+        _cb_borrar(path)
+        return None
+    if datetime.now(timezone.utc) < until:
+        return data
+    _cb_borrar(path)
+    return None
+
+
+def _cb_disparar(path: str, motivo: str) -> None:
+    until = datetime.now(timezone.utc) + timedelta(hours=CB_TTL_HOURS)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "blocked_until": until.isoformat(),
+            "reason": motivo[:300],
+            "hit_at": datetime.now(timezone.utc).isoformat(),
+            "ttl_hours": CB_TTL_HOURS,
+        }, fh, indent=2)
+
+
+def _cb_borrar(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def parse_args(argv=None):
@@ -62,6 +110,17 @@ def main(argv=None):
     parquet_path = PATO_PARQUET if args.pato else PARQUET
     xlsx_path = PATO_XLSX_OUT if args.pato else XLSX
 
+    # Si el portal bloqueó recientemente, saltar sin gastar más intentos.
+    # Return 0 → el orquestador lo marca como corrida OK y no reintenta.
+    cb_path = _cb_path(carpeta_salida)
+    cb = _cb_activo(cb_path)
+    if cb:
+        log.warning(
+            "Circuit breaker activo hasta %s (razón: %s). Skipping corrida.",
+            cb["blocked_until"], cb.get("reason", "?"),
+        )
+        return
+
     mapa_ot = (
         config.cargar_mapa_patente_ot(PATO_XLSX, col_ot=PATO_COL_OT, hoja=PATO_HOJA)
         if args.pato else None
@@ -72,7 +131,13 @@ def main(argv=None):
     log.info("Patentes: %d | maestro previo: %d filas | hasta: %s",
              len(patentes), filas_previas, args.hasta)
 
-    ticket, cookies = login.obtener_sesion()
+    try:
+        ticket, cookies = login.obtener_sesion()
+    except login.PortalBlockedError as e:
+        _cb_disparar(cb_path, str(e))
+        log.error("Portal bloqueó el login (%s). Circuit breaker activado por %dh.",
+                  e, CB_TTL_HOURS)
+        return
     log.info("Login OK (ticket %d chars)", len(ticket))
     sesion = scraper.nueva_sesion(cookies)
 
