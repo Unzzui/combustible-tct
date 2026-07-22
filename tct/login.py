@@ -82,7 +82,11 @@ def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
         navegador = p.chromium.launch(headless=headless)
         ctx = navegador.new_context()
         page = ctx.new_page()
-        page.goto(config.URL_LOGIN, wait_until="load")
+        # `domcontentloaded`, no `load`: esperar todos los subrecursos incluye
+        # terceros (New Relic, widget de WhatsApp) que a veces no cierran en 30s
+        # y tumbaban la corrida sin haber intentado el login siquiera. La señal
+        # real de que la página sirve es el formulario, y eso se espera abajo.
+        page.goto(config.URL_LOGIN, wait_until="domcontentloaded", timeout=60000)
 
         # Campos visibles del login (ids estáticos del portal). Hay que ESCRIBIR
         # carácter por carácter: el JS del sitio cifra los valores en handlers de
