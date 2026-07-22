@@ -5,6 +5,7 @@ por lo que el login no es replicable con requests puro. Playwright corre el JS
 del sitio igual que un humano y nos entrega la sesión autenticada.
 """
 import os
+import re
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -24,21 +25,44 @@ class LoginTimeoutError(RuntimeError):
     layout). Distinto de bloqueo: reintentar es seguro."""
 
 
-# Polling en el DOM: (a) ticket con valor → sesión OK, (b) mensaje de error
-# visible → rechazo del portal, (c) `null` → seguir esperando.
-_JS_ESPERAR_DESENLACE = """
+# Textos que delatan un rechazo del portal. `contact` NO va en la lista: el pie
+# de página dice "contacta a tu ejecutivo de cuenta" de forma permanente, así
+# que no distingue nada — con él, todo intento se leía como bloqueo.
+_PATRON_ERROR = r"bloque|inten|incorr|super[oó]|espere|no coincide|inv[aá]lid|deshabilitad|suspendid"
+
+# Recolector de mensajes de error VISIBLES. Se queda con el nodo más profundo
+# que calza: si no, un contenedor arrastra el pie de página entero y el texto
+# reportado no permite saber qué pasó.
+_JS_CANDIDATOS = """
 () => {
+    const patron = /%s/i;
+    const visible = (el) => el.offsetParent !== null;
+    const texto = (el) => (el.innerText || '').trim();
+    return Array.from(document.querySelectorAll('span, div, label, td, p'))
+        .filter(el => visible(el))
+        .filter(el => {
+            const txt = texto(el);
+            return txt && txt.length < 300 && patron.test(txt);
+        })
+        .filter(el => !Array.from(el.querySelectorAll('span, div, label, td, p'))
+            .some(hijo => visible(hijo) && patron.test(texto(hijo))))
+        .map(texto);
+}
+""" % _PATRON_ERROR
+
+# Polling en el DOM: (a) ticket con valor → sesión OK, (b) mensaje de error
+# NUEVO respecto del que ya estaba antes de enviar → rechazo del portal,
+# (c) `null` → seguir esperando.
+_JS_ESPERAR_DESENLACE = """
+(previos) => {
     const t = document.querySelector('input[name=ticket]');
     if (t && t.value && t.value.length > 20) return {ok: true};
-    const patron = /bloque|inten|incorr|super[oó]|contact|espere|no coincide|inv[aá]lid/i;
-    const errores = Array.from(document.querySelectorAll('span, div, label, td, p'))
-        .filter(el => el.offsetParent !== null)
-        .map(el => (el.innerText || '').trim())
-        .filter(txt => txt && txt.length < 300 && patron.test(txt));
-    if (errores.length) return {ok: false, msg: errores[0]};
+    const candidatos = (%s)();
+    const nuevos = candidatos.filter(txt => !previos.includes(txt));
+    if (nuevos.length) return {ok: false, msg: nuevos[0]};
     return null;
 }
-"""
+""" % _JS_CANDIDATOS
 
 
 def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
@@ -70,23 +94,33 @@ def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
             raise RuntimeError(
                 f"No apareció #TxbUsuario. URL={page.url} título={page.title()!r}."
             )
+
+        # Línea base: lo que ya calzaba con el patrón ANTES de enviar el
+        # formulario es decorado de la página, no un veredicto sobre el login.
+        previos = page.evaluate(_JS_CANDIDATOS)
+
         page.locator("#TxbUsuario").press_sequentially(usuario, delay=30)
         page.locator("#TxbClave").press_sequentially(clave, delay=30)
         page.locator("#TxbClave").blur()
         page.click("#BtnIngresar")
 
-        # Race entre "ticket rellenado" y "mensaje de error visible". El primero
+        # Race entre "ticket rellenado" y "mensaje de error nuevo". El primero
         # que ocurra termina el wait; timeout ⇒ portal silencioso.
         try:
             resultado = page.wait_for_function(
-                _JS_ESPERAR_DESENLACE, timeout=30000
+                _JS_ESPERAR_DESENLACE, arg=previos, timeout=30000
             ).json_value()
         except PlaywrightTimeoutError:
             _dump_debug(page, "timeout")
-            if "LoginDesk" in page.url:
+            # Seguir en una URL de login sin ticket = el postback volvió a
+            # renderizar el formulario. El portal rechaza credenciales así, EN
+            # SILENCIO: no pinta ningún mensaje. Cuenta como rechazo y arma el
+            # circuit breaker — si no, el schedule sigue quemando intentos con
+            # una clave mala dos veces al día y termina bloqueando la cuenta.
+            if re.search(r"/(Login|LoginDesk|LoginMobile)\.aspx|copec\.cl/?$", page.url, re.I):
                 raise PortalBlockedError(
-                    f"Timeout sin ticket, sigue en {page.url}. "
-                    "Portal silencioso — probable bloqueo por intentos."
+                    f"Timeout sin ticket, sigue en {page.url}. Portal rechazó "
+                    "el login sin mensaje (credenciales inválidas o cuenta bloqueada)."
                 )
             raise LoginTimeoutError(
                 f"Timeout post-click; URL={page.url}, título={page.title()!r}."
