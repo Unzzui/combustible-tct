@@ -11,7 +11,7 @@ def test_parse_args_lee_fechas():
 
 def test_parse_args_defaults_rango_y_flota():
     args = main.parse_args([])
-    assert args.desde == "2024-01-01"
+    assert args.desde == "2025-01-01"
     assert args.hasta == date.today().isoformat()
     assert args.flota == "data/Flota.xlsx"
     assert args.patentes is None

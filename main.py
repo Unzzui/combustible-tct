@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -73,8 +74,8 @@ def _cb_borrar(path: str) -> None:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Descarga incremental de consumos por patente (TCT) a Parquet.")
-    p.add_argument("--desde", default="2024-01-01",
-                   help="Inicio del histórico la primera vez / con --rehacer (def: 2024-01-01)")
+    p.add_argument("--desde", default="2025-01-01",
+                   help="Inicio del histórico la primera vez / con --rehacer (def: 2025-01-01)")
     p.add_argument("--hasta", default=date.today().isoformat(),
                    help="Fecha fin YYYY-MM-DD (def: hoy)")
     p.add_argument("--flota", default=FLOTA_POR_DEFECTO,
@@ -102,9 +103,6 @@ def cargar_lista(args):
 
 def main(argv=None):
     args = parse_args(argv)
-    patentes = cargar_lista(args)
-    if not patentes:
-        raise SystemExit("No hay patentes para procesar.")
 
     carpeta_salida = PATO_CARPETA if args.pato else CARPETA_SALIDA
     parquet_path = PATO_PARQUET if args.pato else PARQUET
@@ -121,6 +119,38 @@ def main(argv=None):
         )
         return
 
+    # Fuente de patentes + sesión. En el modo flota por defecto (sin --patentes ni
+    # --pato) la lista se saca del portal en el MISMO login que trae ticket+cookies;
+    # si el portal falla, se cae a Flota.xlsx. Con --patentes/--pato se usa el
+    # archivo y un login simple.
+    usa_portal = not args.patentes and not args.pato
+    if usa_portal:
+        try:
+            ticket, cookies, patentes = login.obtener_sesion_con_flota()
+        except login.PortalBlockedError as e:
+            _cb_disparar(cb_path, str(e))
+            log.error("Portal bloqueó el login (%s). Circuit breaker activado por %dh.",
+                      e, CB_TTL_HOURS)
+            return
+        if not patentes:
+            log.warning("Flota del portal vacía; usando %s como fallback.", args.flota)
+            patentes = cargar_lista(args)
+        else:
+            log.info("Flota del portal: %d patentes.", len(patentes))
+    else:
+        patentes = cargar_lista(args)
+        try:
+            ticket, cookies = login.obtener_sesion()
+        except login.PortalBlockedError as e:
+            _cb_disparar(cb_path, str(e))
+            log.error("Portal bloqueó el login (%s). Circuit breaker activado por %dh.",
+                      e, CB_TTL_HOURS)
+            return
+
+    if not patentes:
+        raise SystemExit("No hay patentes para procesar.")
+    log.info("Login OK (ticket %d chars)", len(ticket))
+
     mapa_ot = (
         config.cargar_mapa_patente_ot(PATO_XLSX, col_ot=PATO_COL_OT, hoja=PATO_HOJA)
         if args.pato else None
@@ -131,14 +161,6 @@ def main(argv=None):
     log.info("Patentes: %d | maestro previo: %d filas | hasta: %s",
              len(patentes), filas_previas, args.hasta)
 
-    try:
-        ticket, cookies = login.obtener_sesion()
-    except login.PortalBlockedError as e:
-        _cb_disparar(cb_path, str(e))
-        log.error("Portal bloqueó el login (%s). Circuit breaker activado por %dh.",
-                  e, CB_TTL_HOURS)
-        return
-    log.info("Login OK (ticket %d chars)", len(ticket))
     sesion = scraper.nueva_sesion(cookies)
 
     nuevos_marcos, fallidas = [], []
@@ -151,7 +173,10 @@ def main(argv=None):
         except Exception as e:  # tolerancia: anota y sigue
             fallidas.append(patente)
             log.error("FALLO %s: %s", patente, e)
-        time.sleep(1.5)  # cortesía con el servidor
+        # Cortesía con el servidor + anti-bloqueo: sleep configurable con jitter
+        # para no golpear a ritmo constante toda la flota (~806 patentes).
+        base = float(os.getenv("TCT_SLEEP_SEG", "3.0"))
+        time.sleep(max(0.5, base + random.uniform(-0.5, 0.5)))
 
     import pandas as pd
     nuevos = pd.concat(nuevos_marcos, ignore_index=True) if nuevos_marcos else pd.DataFrame()
