@@ -183,13 +183,20 @@ def obtener_sesion_con_flota(usuario=None, clave=None, headless=True):
         ctx = navegador.new_context()
         page = ctx.new_page()
         _login_en_page(page, usuario, clave)
+        # Capturar ticket+cookies AQUÍ, sobre la landing recién autenticada donde
+        # el login ya confirmó input[name=ticket] con valor. obtener_flota navega
+        # el portal (postbacks WebForms) y puede dejar la página en una vista sin
+        # ese input; si leyéramos el ticket DESPUÉS, un fallo de la flota
+        # (best-effort) haría timeout esperando el input y tumbaría toda la corrida
+        # en vez de caer al fallback Flota.xlsx. La sesión ya vive en las cookies
+        # del contexto, así que la navegación de la flota no la invalida.
+        ticket = page.input_value("input[name=ticket]")
+        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
         try:
             patentes = flota_portal.obtener_flota(page)
         except Exception as e:  # noqa: BLE001 — el caller decide el fallback
             log.warning("No se pudo leer la flota del portal: %s", e)
             patentes = []
-        ticket = page.input_value("input[name=ticket]")
-        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
         navegador.close()
 
     if not ticket or len(ticket) < 20:
