@@ -67,11 +67,15 @@ def inicio_incremental(maestro, patente: str, default_inicio: str,
     if maestro is None or COL_FECHA not in maestro.columns:
         return default_inicio
     sub = maestro[maestro[COL_PATENTE] == patente]
+    if sub.empty:                       # patente inédita en el maestro → backfill
+        return default_inicio
     if cliente is not None:
+        # asegurar_cliente sobre un df ya NO vacío garantiza la columna Cliente
+        # (sobre uno vacío retornaría sin ella y el filtro daría KeyError).
         sub = asegurar_cliente(sub)
         sub = sub[sub[COL_CLIENTE].astype(str) == str(cliente)]
-    if sub.empty:
-        return default_inicio
+        if sub.empty:                   # patente existe, pero no en este cliente
+            return default_inicio
     ultima = pd.to_datetime(sub[COL_FECHA]).max()
     inicio = (ultima - pd.Timedelta(days=overlap_dias)).date()
     return inicio.isoformat()

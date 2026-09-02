@@ -117,6 +117,30 @@ def test_inicio_incremental_cliente_nuevo_usa_default():
                                       cliente="799127") == "2024-01-01"
 
 
+def test_inicio_incremental_patente_ausente_con_cliente_no_revienta():
+    # Regresión: patente que NO está en el maestro (típico de 799127, cliente
+    # nuevo). Antes `sub` quedaba vacío, asegurar_cliente retornaba sin columna
+    # Cliente y el filtro daba KeyError, matando toda la corrida.
+    maestro = _df({
+        "Patente": ["OTRA-99"],
+        "Cliente": ["754405"],
+        "Fecha Transacción": [pd.Timestamp("2026-08-20")],
+    })
+    assert almacen.inicio_incremental(maestro, "THJG-11", "2025-01-01",
+                                      cliente="799127") == "2025-01-01"
+
+
+def test_inicio_incremental_maestro_sin_columnas_cliente_ni_tarjeta():
+    # Maestro con la patente pero sin Cliente NI Tarjeta: no se puede saber el
+    # cliente → backfill (default), sin reventar.
+    maestro = _df({
+        "Patente": ["THJG-11"],
+        "Fecha Transacción": [pd.Timestamp("2026-08-20")],
+    })
+    assert almacen.inicio_incremental(maestro, "THJG-11", "2025-01-01",
+                                      cliente="799127") == "2025-01-01"
+
+
 def test_inicio_incremental_deriva_cliente_desde_tarjeta_si_falta_columna():
     # maestro viejo sin columna Cliente pero con Tarjeta -> se deriva
     maestro = _df({
