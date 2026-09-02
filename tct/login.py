@@ -68,6 +68,71 @@ _JS_ESPERAR_DESENLACE = """
 """ % _JS_CANDIDATOS
 
 
+# --- Selección de cliente (pasarela RadWindowClientes) ------------------------
+# Tras el login, la cuenta puede acceder a VARIOS clientes (p. ej. OCA ENSAYOS
+# 754405 y OCA GLOBAL 799127). El portal muestra una ventana con una fila por
+# cliente; cada uno ve SOLO sus consumos y su flota. El `ticket` es el mismo para
+# todos: el contexto de cliente vive en las cookies de sesión que cambian al
+# seleccionar la fila. Sin seleccionar, el portal usa un cliente por defecto (por
+# eso, hasta ahora, solo se bajaban los consumos de ese cliente).
+
+_JS_LEER_CLIENTES = """
+() => Array.from(document.querySelectorAll("a[id*='LinkBtnIngresar']")).map(a => {
+    const tr = a.closest('tr');
+    return {id: a.id, texto: ((tr ? tr.innerText : a.innerText) || '').replace(/\\s+/g,' ').trim()};
+})
+"""
+
+# "754405 OCA ENSAYOS INSPECCIONES Y" -> ("754405", "OCA ENSAYOS INSPECCIONES Y")
+_RE_FILA_CLIENTE = re.compile(r"^\s*(\d{4,})\s+(.*?)\s*$")
+
+
+def parse_clientes(rows):
+    """Convierte las filas de la grilla (dicts con id/texto) en tuplas
+    (codigo, nombre, anchor_id). Ignora filas sin código numérico."""
+    out = []
+    for r in rows:
+        texto = re.sub(r"\s*Ingresar\s*$", "", (r.get("texto") or "").strip())
+        m = _RE_FILA_CLIENTE.match(texto)
+        if m:
+            out.append((m.group(1), m.group(2).strip(), r.get("id")))
+    return out
+
+
+def id_anchor_de_cliente(clientes, codigo):
+    """anchor_id de la fila cuyo código == `codigo`, o None."""
+    for cod, _nombre, anchor_id in clientes:
+        if cod == str(codigo):
+            return anchor_id
+    return None
+
+
+def _leer_clientes(page):
+    """Lee la ventana de selección; [] si la cuenta tiene un solo cliente."""
+    try:
+        return parse_clientes(page.evaluate(_JS_LEER_CLIENTES))
+    except Exception:
+        return []
+
+
+def _seleccionar_cliente(page, clientes, codigo):
+    """Entra al cliente `codigo` haciendo click REAL en su fila (ejecuta el href
+    javascript:__doPostBack en contexto normal; page.evaluate(__doPostBack) rompe
+    por el strict-mode de ASP.NET AJAX). Deja la página en la vista del cliente."""
+    anchor_id = id_anchor_de_cliente(clientes, codigo)
+    if not anchor_id:
+        disponibles = ", ".join(c[0] for c in clientes) or "(ninguno)"
+        raise RuntimeError(
+            f"Cliente {codigo!r} no está en la ventana. Disponibles: {disponibles}."
+        )
+    page.eval_on_selector(f"#{anchor_id}", "el => el.click()")
+    try:
+        page.wait_for_url("**/AdmCteInicio.aspx", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass  # algunos clientes aterrizan en otra vista; el ticket igual queda
+    page.wait_for_load_state("networkidle")
+
+
 def _login_en_page(page, usuario, clave, debug=False):
     """Loguea en el portal sobre una página Playwright dada, dejándola autenticada.
 
@@ -162,14 +227,19 @@ def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
     return ticket, cookies
 
 
-def obtener_sesion_con_flota(usuario=None, clave=None, headless=True):
-    """Un solo login: devuelve (ticket, cookies, patentes_del_portal).
+def obtener_sesion_con_flota(usuario=None, clave=None, cliente=None, headless=True):
+    """Un solo login: devuelve (ticket, cookies, patentes_del_portal, clientes).
 
     Reutiliza la MISMA sesión para (a) scrapear la lista de flota del informe y
     (b) extraer ticket+cookies para la descarga per-patente. Si el scraping de la
     flota falla, patentes=[] (el caller decide el fallback) pero ticket+cookies
     quedan disponibles. Levanta las mismas excepciones que obtener_sesion si el
     login mismo falla.
+
+    `clientes` es la lista [(codigo, nombre, anchor_id)] de la ventana de selección
+    (vacía si la cuenta tiene un solo cliente). Si `cliente` (código) se indica, se
+    entra a ESE cliente antes de leer ticket/cookies/flota, de modo que todo quede
+    en su contexto (sus cookies y su flota).
     """
     from tct import flota_portal
 
@@ -183,6 +253,9 @@ def obtener_sesion_con_flota(usuario=None, clave=None, headless=True):
         ctx = navegador.new_context()
         page = ctx.new_page()
         _login_en_page(page, usuario, clave)
+        clientes = _leer_clientes(page)
+        if cliente is not None:
+            _seleccionar_cliente(page, clientes, cliente)
         # Capturar ticket+cookies AQUÍ, sobre la landing recién autenticada donde
         # el login ya confirmó input[name=ticket] con valor. obtener_flota navega
         # el portal (postbacks WebForms) y puede dejar la página en una vista sin
@@ -203,7 +276,25 @@ def obtener_sesion_con_flota(usuario=None, clave=None, headless=True):
         raise LoginTimeoutError(
             "No se obtuvo 'ticket' tras el login. Revisá credenciales."
         )
-    return ticket, cookies, patentes
+    return ticket, cookies, patentes, clientes
+
+
+def listar_clientes(usuario=None, clave=None, headless=True):
+    """Devuelve [(codigo, nombre)] de los clientes accesibles con la cuenta.
+    Un login liviano que solo lee la ventana de selección (sin scrapear flota)."""
+    usuario = usuario or config.USER_TCT
+    clave = clave or config.PASS_TCT
+    if not usuario or not clave:
+        raise RuntimeError("Faltan USER_TCT/PASS_TCT en el .env")
+
+    with sync_playwright() as p:
+        navegador = p.chromium.launch(headless=headless)
+        ctx = navegador.new_context()
+        page = ctx.new_page()
+        _login_en_page(page, usuario, clave)
+        clientes = _leer_clientes(page)
+        navegador.close()
+    return [(cod, nombre) for cod, nombre, _id in clientes]
 
 
 def _dump_debug(page, sufijo: str) -> None:

@@ -39,6 +39,10 @@ class _Page:
         # 40 chars: pasa el umbral len<20 de obtener_sesion_con_flota
         return "T" * 40
 
+    def evaluate(self, *a, **k):
+        # _leer_clientes(page): cuenta de un solo cliente (sin ventana) → []
+        return []
+
 
 def _instalar_flota(monkeypatch, fn):
     """Inyecta un `tct.flota_portal` falso para no depender de Playwright real."""
@@ -93,14 +97,15 @@ def test_flota_falla_pero_devuelve_ticket_y_cae_a_fallback(monkeypatch):
         page.navegado = True
         raise RuntimeError("Cannot read properties of undefined (reading 'elements')")
 
-    page, (ticket, cookies, patentes) = _correr(monkeypatch, flota_rota)
+    page, (ticket, cookies, patentes, clientes) = _correr(monkeypatch, flota_rota)
     assert ticket == "T" * 40
     assert cookies == {"sesion": "abc123"}
     assert patentes == []  # el caller (main.py) cae a Flota.xlsx
+    assert clientes == []
 
 
 def test_flota_ok_devuelve_patentes(monkeypatch):
-    page, (ticket, cookies, patentes) = _correr(
+    page, (ticket, cookies, patentes, clientes) = _correr(
         monkeypatch, lambda page: ["LRBJ-98", "VYJH-62"]
     )
     assert ticket == "T" * 40

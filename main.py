@@ -135,6 +135,35 @@ def cargar_lista(args):
     return config.cargar_patentes_flota(args.flota)
 
 
+def _descargar_cliente(sesion, ticket, patentes, codigo, maestro, args):
+    """Descarga todas las patentes de un cliente y devuelve (marcos, fallidas).
+
+    Cada fila descargada se etiqueta con su `Cliente` (código) para que el maestro
+    distinga a qué cliente pertenece cada consumo — clave porque una misma patente
+    puede existir bajo dos clientes y llevar su propio avance incremental. Con
+    `codigo=None` (modo --patentes/--pato, un solo cliente) no se etiqueta: el
+    Cliente se deriva luego de la Tarjeta al fusionar.
+    """
+    marcos, fallidas = [], []
+    for patente in patentes:
+        desde_p = almacen.inicio_incremental(maestro, patente, args.desde, cliente=codigo)
+        try:
+            df = scraper.descargar_patente_df(sesion, ticket, patente, desde_p, args.hasta)
+            if not df.empty and codigo is not None:
+                df[almacen.COL_CLIENTE] = codigo
+            marcos.append(df)
+            log.info("OK %s cliente %s desde %s (%d filas)",
+                     patente, codigo, desde_p, len(df))
+        except Exception as e:  # tolerancia: anota y sigue
+            fallidas.append(f"{patente}/{codigo}" if codigo is not None else patente)
+            log.error("FALLO %s cliente %s: %s", patente, codigo, e)
+        # Cortesía con el servidor + anti-bloqueo: sleep configurable con jitter
+        # para no golpear a ritmo constante toda la flota.
+        base = float(os.getenv("TCT_SLEEP_SEG", "3.0"))
+        time.sleep(max(0.5, base + random.uniform(-0.5, 0.5)))
+    return marcos, fallidas
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -163,32 +192,6 @@ def main(argv=None):
             "a correr con --reset-bloqueo."
         )
 
-    # Fuente de patentes + sesión. En el modo flota por defecto (sin --patentes ni
-    # --pato) la lista se saca del portal en el MISMO login que trae ticket+cookies;
-    # si el portal falla, se cae a Flota.xlsx. Con --patentes/--pato se usa el
-    # archivo y un login simple.
-    usa_portal = not args.patentes and not args.pato
-    if usa_portal:
-        try:
-            ticket, cookies, patentes = login.obtener_sesion_con_flota()
-        except login.PortalBlockedError as e:
-            _abortar_por_login(cb_path, e)
-        if not patentes:
-            log.warning("Flota del portal vacía; usando %s como fallback.", args.flota)
-            patentes = cargar_lista(args)
-        else:
-            log.info("Flota del portal: %d patentes.", len(patentes))
-    else:
-        patentes = cargar_lista(args)
-        try:
-            ticket, cookies = login.obtener_sesion()
-        except login.PortalBlockedError as e:
-            _abortar_por_login(cb_path, e)
-
-    if not patentes:
-        raise SystemExit("No hay patentes para procesar.")
-    log.info("Login OK (ticket %d chars)", len(ticket))
-
     mapa_ot = (
         config.cargar_mapa_patente_ot(PATO_XLSX, col_ot=PATO_COL_OT, hoja=PATO_HOJA)
         if args.pato else None
@@ -196,25 +199,55 @@ def main(argv=None):
 
     maestro = None if args.rehacer else almacen.leer_maestro(parquet_path)
     filas_previas = 0 if maestro is None else len(maestro)
-    log.info("Patentes: %d | maestro previo: %d filas | hasta: %s",
-             len(patentes), filas_previas, args.hasta)
+    log.info("Maestro previo: %d filas | hasta: %s", filas_previas, args.hasta)
 
-    sesion = scraper.nueva_sesion(cookies)
-
+    # Fuente de patentes + sesión. En el modo flota por defecto (sin --patentes ni
+    # --pato) la cuenta puede acceder a VARIOS clientes (p. ej. OCA ENSAYOS 754405 y
+    # OCA GLOBAL 799127); cada uno tiene su propia flota y ve SOLO sus consumos, así
+    # que hay que recorrerlos todos: por cliente, login → su flota del portal →
+    # descarga per-patente en su contexto. Con --patentes/--pato se usa el archivo y
+    # un login simple (un solo cliente, sin recorrer la pasarela).
+    usa_portal = not args.patentes and not args.pato
     nuevos_marcos, fallidas = [], []
-    for patente in patentes:
-        desde_p = almacen.inicio_incremental(maestro, patente, args.desde)
+
+    if usa_portal:
         try:
-            df = scraper.descargar_patente_df(sesion, ticket, patente, desde_p, args.hasta)
-            nuevos_marcos.append(df)
-            log.info("OK %s desde %s (%d filas)", patente, desde_p, len(df))
-        except Exception as e:  # tolerancia: anota y sigue
-            fallidas.append(patente)
-            log.error("FALLO %s: %s", patente, e)
-        # Cortesía con el servidor + anti-bloqueo: sleep configurable con jitter
-        # para no golpear a ritmo constante toda la flota (~806 patentes).
-        base = float(os.getenv("TCT_SLEEP_SEG", "3.0"))
-        time.sleep(max(0.5, base + random.uniform(-0.5, 0.5)))
+            clientes = login.listar_clientes()
+        except login.PortalBlockedError as e:
+            _abortar_por_login(cb_path, e)
+        if not clientes:                    # cuenta de un solo cliente, sin ventana
+            clientes = [(None, "default")]
+        log.info("Clientes accesibles: %s",
+                 ", ".join(f"{cod}({nom})" for cod, nom in clientes))
+
+        for codigo, nombre in clientes:
+            try:
+                ticket, cookies, patentes, _ = login.obtener_sesion_con_flota(cliente=codigo)
+            except login.PortalBlockedError as e:
+                _abortar_por_login(cb_path, e)
+            if not patentes:
+                log.warning("Flota vacía para cliente %s; fallback a %s.",
+                            codigo, args.flota)
+                patentes = cargar_lista(args)
+            log.info("Cliente %s (%s): %d patentes | login OK (ticket %d chars)",
+                     codigo, nombre, len(patentes), len(ticket))
+            marcos, fall = _descargar_cliente(
+                scraper.nueva_sesion(cookies), ticket, patentes, codigo, maestro, args)
+            nuevos_marcos += marcos
+            fallidas += fall
+    else:
+        patentes = cargar_lista(args)
+        try:
+            ticket, cookies = login.obtener_sesion()
+        except login.PortalBlockedError as e:
+            _abortar_por_login(cb_path, e)
+        if not patentes:
+            raise SystemExit("No hay patentes para procesar.")
+        log.info("Login OK (ticket %d chars) | Patentes: %d", len(ticket), len(patentes))
+        marcos, fall = _descargar_cliente(
+            scraper.nueva_sesion(cookies), ticket, patentes, None, maestro, args)
+        nuevos_marcos += marcos
+        fallidas += fall
 
     import pandas as pd
     nuevos = pd.concat(nuevos_marcos, ignore_index=True) if nuevos_marcos else pd.DataFrame()
