@@ -14,6 +14,15 @@ COL_GUIA = "Guía de Despacho"
 COL_PATENTE = "Patente"
 COL_CLIENTE = "Cliente"
 COL_TARJETA = "Tarjeta"
+COL_RUT_CHOFER = "Rut Chofer"
+
+# Correcciones de RUT del chofer: (patente, rut_en_portal, rut_correcto). Misma
+# persona registrada con dos RUT distintos en el portal; se normaliza al correcto.
+# Se aplica en cada fusión, así arregla tanto el histórico ya guardado como lo que
+# baje después (una re-descarga trae de nuevo el RUT malo del portal).
+CORRECCIONES_RUT_CHOFER = [
+    ("THJG-11", "18841039-1", "12393967-0"),
+]
 
 # El nº de tarjeta trae embebido el código de cliente: "1-799127-00477-3-3".
 _RE_CLIENTE_TARJETA = re.compile(r"^\s*\d+-(\d+)-")
@@ -81,9 +90,24 @@ def inicio_incremental(maestro, patente: str, default_inicio: str,
     return inicio.isoformat()
 
 
+def aplicar_correcciones(df):
+    """Aplica CORRECCIONES_RUT_CHOFER: normaliza el RUT del chofer para una patente
+    puntual. No toca ese RUT en otras patentes. Devuelve una copia."""
+    if df is None or df.empty:
+        return df
+    if COL_PATENTE not in df.columns or COL_RUT_CHOFER not in df.columns:
+        return df
+    df = df.copy()
+    rut = df[COL_RUT_CHOFER].astype(str)
+    for patente, malo, bueno in CORRECCIONES_RUT_CHOFER:
+        mask = (df[COL_PATENTE] == patente) & (rut == malo)
+        df.loc[mask, COL_RUT_CHOFER] = bueno
+    return df
+
+
 def fusionar(maestro, nuevos) -> pd.DataFrame:
     """Une maestro + nuevos y deduplica por (Patente, N° de guía), quedándose con
-    la última versión. Ordena por patente y fecha."""
+    la última versión. Ordena por patente y fecha. Aplica correcciones de RUT."""
     marcos = [asegurar_cliente(df) for df in (maestro, nuevos)
               if df is not None and not df.empty]
     if not marcos:
@@ -95,6 +119,7 @@ def fusionar(maestro, nuevos) -> pd.DataFrame:
     orden = [c for c in (COL_PATENTE, COL_FECHA) if c in total.columns]
     if orden:
         total = total.sort_values(orden)
+    total = aplicar_correcciones(total)
     return total.reset_index(drop=True)
 
 

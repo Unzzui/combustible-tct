@@ -7,6 +7,40 @@ def _df(filas):
     return pd.DataFrame(filas)
 
 
+def test_aplicar_correcciones_reemplaza_rut_solo_en_thjg11():
+    df = _df({
+        "Patente": ["THJG-11", "THJG-11", "SRYH-63"],
+        "Rut Chofer": ["18841039-1", "12687773-0", "18841039-1"],
+    })
+    out = almacen.aplicar_correcciones(df)
+    # THJG-11 + 18841039-1 -> 12393967-0; el otro RUT de THJG-11 intacto;
+    # y 18841039-1 en OTRA patente (SRYH-63) NO se toca.
+    assert list(out["Rut Chofer"]) == ["12393967-0", "12687773-0", "18841039-1"]
+
+
+def test_aplicar_correcciones_sin_columnas_no_revienta():
+    assert almacen.aplicar_correcciones(_df({"Patente": ["THJG-11"]})) is not None
+    assert almacen.aplicar_correcciones(pd.DataFrame()).empty
+
+
+def test_fusionar_aplica_correccion_rut_a_historico_y_nuevos():
+    # Histórico con la carga vieja mal (18841039-1) + descarga nueva también mal.
+    maestro = _df({
+        "Patente": ["THJG-11"],
+        "Guía de Despacho": [111],
+        "Rut Chofer": ["18841039-1"],
+        "Fecha Transacción": [pd.Timestamp("2026-08-31")],
+    })
+    nuevos = _df({
+        "Patente": ["THJG-11"],
+        "Guía de Despacho": [222],
+        "Rut Chofer": ["18841039-1"],
+        "Fecha Transacción": [pd.Timestamp("2026-09-10")],
+    })
+    total = almacen.fusionar(maestro, nuevos)
+    assert set(total["Rut Chofer"]) == {"12393967-0"}   # ambas corregidas
+
+
 def test_inicio_incremental_sin_maestro_usa_default():
     assert almacen.inicio_incremental(None, "PDRF-74", "2024-01-01") == "2024-01-01"
 
