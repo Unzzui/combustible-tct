@@ -13,6 +13,9 @@ from tct import login
 
 
 class _Ctx:
+    def route(self, *a, **k):
+        return None
+
     def cookies(self):
         return [{"name": "sesion", "value": "abc123"}]
 

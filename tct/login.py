@@ -7,6 +7,7 @@ del sitio igual que un humano y nos entrega la sesión autenticada.
 import logging
 import os
 import re
+from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -115,6 +116,40 @@ def _leer_clientes(page):
         return []
 
 
+# Telemetría de terceros que no aporta nada al scraping. Los beacons de New
+# Relic (bam.nr-data.net) quedan colgados sin responder desde 2026-09-22 y, con
+# ellos abiertos, `networkidle` nunca llega: la selección de cliente moría por
+# timeout de 30s aunque la página ya estaba lista. Imágenes/fuentes/media
+# tampoco se usan (el banner en S3 de Copec también quedaba colgado).
+_HOSTS_BLOQUEADOS = re.compile(r"(^|\.)(nr-data\.net|newrelic\.com)$", re.I)
+_TIPOS_BLOQUEADOS = {"image", "media", "font"}
+
+
+def _filtrar_request(route):
+    req = route.request
+    host = urlparse(req.url).hostname or ""
+    if req.resource_type in _TIPOS_BLOQUEADOS or _HOSTS_BLOQUEADOS.search(host):
+        route.abort()
+    else:
+        route.continue_()
+
+
+def _nuevo_contexto(navegador):
+    """Contexto de navegador con la telemetría y los recursos pesados bloqueados."""
+    ctx = navegador.new_context()
+    ctx.route("**/*", _filtrar_request)
+    return ctx
+
+
+def _esperar_red_quieta(page, timeout=10000):
+    """`networkidle` best-effort: si un tercero deja una conexión abierta no debe
+    tumbar la corrida; el caller ya esperó la señal real (el ticket)."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PlaywrightTimeoutError:
+        log.debug("networkidle no llegó en %d ms; se continúa", timeout)
+
+
 def _seleccionar_cliente(page, clientes, codigo):
     """Entra al cliente `codigo` haciendo click REAL en su fila (ejecuta el href
     javascript:__doPostBack en contexto normal; page.evaluate(__doPostBack) rompe
@@ -130,7 +165,13 @@ def _seleccionar_cliente(page, clientes, codigo):
         page.wait_for_url("**/AdmCteInicio.aspx", timeout=15000)
     except PlaywrightTimeoutError:
         pass  # algunos clientes aterrizan en otra vista; el ticket igual queda
-    page.wait_for_load_state("networkidle")
+    # La señal real de que la vista del cliente sirve es el ticket, no la red.
+    page.wait_for_function(
+        "() => { const t = document.querySelector('input[name=ticket]');"
+        " return t && t.value && t.value.length > 20; }",
+        timeout=30000,
+    )
+    _esperar_red_quieta(page)
 
 
 def _login_en_page(page, usuario, clave, debug=False):
@@ -193,7 +234,7 @@ def _login_en_page(page, usuario, clave, debug=False):
             f"Portal rechazó el login: {resultado.get('msg', '?')!r}"
         )
 
-    page.wait_for_load_state("networkidle")
+    _esperar_red_quieta(page)
     if debug:
         page.screenshot(path="debug_login.png")
 
@@ -213,7 +254,7 @@ def obtener_sesion(usuario=None, clave=None, headless=True, debug=False):
 
     with sync_playwright() as p:
         navegador = p.chromium.launch(headless=headless)
-        ctx = navegador.new_context()
+        ctx = _nuevo_contexto(navegador)
         page = ctx.new_page()
         _login_en_page(page, usuario, clave, debug=debug)
         ticket = page.input_value("input[name=ticket]")
@@ -250,7 +291,7 @@ def obtener_sesion_con_flota(usuario=None, clave=None, cliente=None, headless=Tr
 
     with sync_playwright() as p:
         navegador = p.chromium.launch(headless=headless)
-        ctx = navegador.new_context()
+        ctx = _nuevo_contexto(navegador)
         page = ctx.new_page()
         _login_en_page(page, usuario, clave)
         clientes = _leer_clientes(page)
@@ -289,7 +330,7 @@ def listar_clientes(usuario=None, clave=None, headless=True):
 
     with sync_playwright() as p:
         navegador = p.chromium.launch(headless=headless)
-        ctx = navegador.new_context()
+        ctx = _nuevo_contexto(navegador)
         page = ctx.new_page()
         _login_en_page(page, usuario, clave)
         clientes = _leer_clientes(page)
