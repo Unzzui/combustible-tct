@@ -18,6 +18,50 @@ def test_aplicar_correcciones_reemplaza_rut_solo_en_thjg11():
     assert list(out["Rut Chofer"]) == ["12393967-0", "12687773-0", "18841039-1"]
 
 
+def test_reasigna_patente_por_conductor_habitual():
+    # TODAS las cargas de 18841039-1 van a WDHG-23, en cualquier patente de origen.
+    # Otro chofer en las mismas patentes queda intacto.
+    df = _df({
+        "Patente": ["SRYH-63", "TBFB-92", "THJV-47", "SRYH-63"],
+        "Rut Chofer": ["18841039-1", "18841039-1", "18841039-1", "12687773-0"],
+    })
+    out = almacen.aplicar_correcciones(df)
+    assert list(out["Patente"]) == ["WDHG-23", "WDHG-23", "WDHG-23", "SRYH-63"]
+
+
+def test_correccion_rut_tiene_prioridad_sobre_patente_habitual():
+    # En THJG-11 la carga de 18841039-1 se reatribuye a 12393967-0 PRIMERO, así que
+    # ya no es "de Lila" y NO se mueve a WDHG-23: queda en THJG-11 con el RUT bueno.
+    df = _df({
+        "Patente": ["THJG-11"],
+        "Rut Chofer": ["18841039-1"],
+    })
+    out = almacen.aplicar_correcciones(df)
+    assert list(out["Rut Chofer"]) == ["12393967-0"]
+    assert list(out["Patente"]) == ["THJG-11"]
+
+
+def test_fusionar_reasigna_patente_y_deduplica_contra_copia_existente():
+    # El maestro ya tiene la carga reasignada a WDHG-23; la re-descarga la trae con
+    # su patente original (SRYH-63) y la MISMA guía. Tras fusionar debe quedar UNA
+    # sola fila en WDHG-23 (la reasignación va antes del dedup).
+    maestro = _df({
+        "Patente": ["WDHG-23"],
+        "Guía de Despacho": [555],
+        "Rut Chofer": ["18841039-1"],
+        "Fecha Transacción": [pd.Timestamp("2026-01-15")],
+    })
+    nuevos = _df({
+        "Patente": ["SRYH-63"],
+        "Guía de Despacho": [555],
+        "Rut Chofer": ["18841039-1"],
+        "Fecha Transacción": [pd.Timestamp("2026-01-15")],
+    })
+    total = almacen.fusionar(maestro, nuevos)
+    assert len(total) == 1
+    assert list(total["Patente"]) == ["WDHG-23"]
+
+
 def test_aplicar_correcciones_sin_columnas_no_revienta():
     assert almacen.aplicar_correcciones(_df({"Patente": ["THJG-11"]})) is not None
     assert almacen.aplicar_correcciones(pd.DataFrame()).empty

@@ -24,6 +24,17 @@ CORRECCIONES_RUT_CHOFER = [
     ("THJG-11", "18841039-1", "12393967-0"),
 ]
 
+# Reasignación de patente por conductor habitual: (rut_chofer, patente_habitual).
+# TODA transacción de ese chofer se atribuye a su camioneta asignada, sin importar
+# bajo qué patente entró en el portal (la tarjeta se usa en varios vehículos, pero
+# el consumo corresponde a su vehículo habitual). Se aplica DESPUÉS de las
+# correcciones de RUT (un registro reatribuido a otro chofer ya no calza por RUT) y
+# ANTES del dedup en fusionar (una re-descarga trae la patente original del portal;
+# al reasignarla antes de deduplicar, colapsa con la copia ya corregida y no duplica).
+CORRECCIONES_PATENTE_HABITUAL = [
+    ("18841039-1", "WDHG-23"),   # Lila Nicole Vives Ortega, conductora habitual de WDHG-23
+]
+
 # El nº de tarjeta trae embebido el código de cliente: "1-799127-00477-3-3".
 _RE_CLIENTE_TARJETA = re.compile(r"^\s*\d+-(\d+)-")
 
@@ -91,8 +102,13 @@ def inicio_incremental(maestro, patente: str, default_inicio: str,
 
 
 def aplicar_correcciones(df):
-    """Aplica CORRECCIONES_RUT_CHOFER: normaliza el RUT del chofer para una patente
-    puntual. No toca ese RUT en otras patentes. Devuelve una copia."""
+    """Aplica las correcciones manuales sobre el df. Devuelve una copia.
+
+    1) CORRECCIONES_RUT_CHOFER: normaliza el RUT del chofer para una patente
+       puntual (no toca ese RUT en otras patentes).
+    2) CORRECCIONES_PATENTE_HABITUAL: reasigna la patente de TODAS las cargas de
+       un chofer a su camioneta habitual. Va después de (1) a propósito: así un
+       registro ya reatribuido a otro chofer no se arrastra por el RUT de abajo."""
     if df is None or df.empty:
         return df
     if COL_PATENTE not in df.columns or COL_RUT_CHOFER not in df.columns:
@@ -102,6 +118,9 @@ def aplicar_correcciones(df):
     for patente, malo, bueno in CORRECCIONES_RUT_CHOFER:
         mask = (df[COL_PATENTE] == patente) & (rut == malo)
         df.loc[mask, COL_RUT_CHOFER] = bueno
+    rut = df[COL_RUT_CHOFER].astype(str)   # recalcular tras el paso (1)
+    for rut_habitual, patente_habitual in CORRECCIONES_PATENTE_HABITUAL:
+        df.loc[rut == rut_habitual, COL_PATENTE] = patente_habitual
     return df
 
 
@@ -113,13 +132,18 @@ def fusionar(maestro, nuevos) -> pd.DataFrame:
     if not marcos:
         return pd.DataFrame()
     total = pd.concat(marcos, ignore_index=True)
+    # Correcciones ANTES del dedup: la reasignación de patente por conductor
+    # habitual cambia la Patente, que es parte de la clave de dedup. Si se
+    # aplicara después, una carga re-descargada bajo su patente original (p. ej.
+    # SRYH-63) no colapsaría con la copia ya reasignada (WDHG-23) y quedaría
+    # duplicada. Aplicándola antes, ambas quedan en WDHG-23 y el dedup las une.
+    total = aplicar_correcciones(total)
     subset = [c for c in (COL_PATENTE, COL_GUIA) if c in total.columns]
     if subset:
         total = total.drop_duplicates(subset=subset, keep="last")
     orden = [c for c in (COL_PATENTE, COL_FECHA) if c in total.columns]
     if orden:
         total = total.sort_values(orden)
-    total = aplicar_correcciones(total)
     return total.reset_index(drop=True)
 
 
