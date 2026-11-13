@@ -18,6 +18,16 @@ def _env(nombre: str) -> str:
 USER_TCT = _env("USER_TCT")
 PASS_TCT = _env("PASS_TCT")
 
+# Credenciales IMAP del buzón que recibe el OTP de login de COPEC TCT
+# (correo "COPEC TCT: Código de verificación" de info@copec.cl). Es una cuenta
+# @ocaglobal.com servida por Google Workspace, por lo que se lee vía
+# imap.gmail.com con un app-password. Mismas credenciales que usa oca-wom. Se
+# inyectan como secrets desde el .env del mini-server (ver service.yaml); no van
+# en este repo.
+MAIL_USER = _env("MAIL_USER")
+MAIL_PASS = _env("MAIL_PASS")
+MAIL_HOST = _env("MAIL_HOST") or "imap.gmail.com"
+
 
 def cargar_patentes(ruta: str) -> list[str]:
     """Lee patentes (una por línea), ignora líneas vacías y recorta espacios."""

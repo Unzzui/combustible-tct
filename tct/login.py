@@ -13,6 +13,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from tct import config
+from tct.mail_reader import MailReader
 
 log = logging.getLogger("tct")
 
@@ -58,6 +59,26 @@ _JS_CANDIDATOS = """
 # NUEVO respecto del que ya estaba antes de enviar → rechazo del portal,
 # (c) `null` → seguir esperando.
 _JS_ESPERAR_DESENLACE = """
+(previos) => {
+    const t = document.querySelector('input[name=ticket]');
+    if (t && t.value && t.value.length > 20) return {ok: true};
+    // 2FA: el modal "#popup-otp" (class popup-overlay) se muestra con
+    // display:flex y se oculta con display:none. Es la señal fiable de que el
+    // portal pide el código. NO usar offsetParent del campo: el modal es un
+    // overlay posicionado y offsetParent puede ser null aunque esté visible.
+    const modal = document.querySelector('#popup-otp');
+    if (modal && getComputedStyle(modal).display !== 'none') return {otp: true};
+    const candidatos = (%s)();
+    const nuevos = candidatos.filter(txt => !previos.includes(txt));
+    if (nuevos.length) return {ok: false, msg: nuevos[0]};
+    return null;
+}
+""" % _JS_CANDIDATOS
+
+# Igual que el anterior pero SIN detectar OTP: se usa tras enviar el código, para
+# esperar el desenlace final (ticket o rechazo) sin volver a entrar al flujo OTP
+# mientras el modal de 2FA se re-renderiza en el postback.
+_JS_ESPERAR_TICKET = """
 (previos) => {
     const t = document.querySelector('input[name=ticket]');
     if (t && t.value && t.value.length > 20) return {ok: true};
@@ -174,11 +195,73 @@ def _seleccionar_cliente(page, clientes, codigo):
     _esperar_red_quieta(page)
 
 
+def _ingresar_codigo_otp(page, code):
+    """Escribe `code` en #TxbOtpCodigo.
+
+    El campo nace `readonly` (el portal lo protege con protegerCampoOtp y lo
+    habilita con habilitarCampoOtp en handlers de mouse/teclado). Se dispara con
+    un click real y, como respaldo, se le remueve el readonly a mano y se fuerza
+    el value con un evento `input` (el oninput del sitio filtra no-dígitos y
+    recorta a 6)."""
+    campo = page.locator("#TxbOtpCodigo")
+    campo.scroll_into_view_if_needed()
+    try:
+        campo.click()  # onmousedown=habilitarCampoOtp → quita el readonly
+    except Exception:
+        pass
+    page.eval_on_selector("#TxbOtpCodigo", "el => el.removeAttribute('readonly')")
+    try:
+        campo.fill("")
+        campo.press_sequentially(code, delay=60)
+    except Exception:
+        pass
+    # Respaldo: fijar el value y disparar input por si el tipeo no prendió.
+    page.eval_on_selector(
+        "#TxbOtpCodigo",
+        "(el, v) => { el.value = v;"
+        " el.dispatchEvent(new Event('input', {bubbles: true})); }",
+        code,
+    )
+
+
+def _resolver_otp(page, reader, baseline, previos):
+    """El portal pidió 2FA: lee el código del correo, lo ingresa y lo valida.
+
+    Devuelve el dict de desenlace final (ticket OK o rechazo). Levanta
+    LoginTimeoutError si tras validar no aparece ni ticket ni mensaje."""
+    log.info("Portal pidió código OTP; esperando el correo de verificación...")
+    _dump_debug(page, "otp_pedido")
+    try:
+        code = reader.wait_for_new_otp(baseline, timeout=90, poll_interval=5)
+    except TimeoutError:
+        log.warning("OTP no llegó en 90s; solicito reenvío y espero más.")
+        try:
+            page.eval_on_selector("#BtnReenviarOtp", "el => el.click()")
+        except Exception:
+            pass
+        code = reader.wait_for_new_otp(baseline, timeout=120, poll_interval=5)
+    log.info("OTP recibido (%d dígitos); validando.", len(code))
+    _ingresar_codigo_otp(page, code)
+    page.eval_on_selector("#BtnValidarOtp", "el => el.click()")
+    try:
+        return page.wait_for_function(
+            _JS_ESPERAR_TICKET, arg=previos, timeout=30000
+        ).json_value()
+    except PlaywrightTimeoutError:
+        _dump_debug(page, "otp_timeout")
+        raise LoginTimeoutError(
+            f"Timeout tras validar el OTP; URL={page.url}, "
+            f"título={page.title()!r}."
+        )
+
+
 def _login_en_page(page, usuario, clave, debug=False):
     """Loguea en el portal sobre una página Playwright dada, dejándola autenticada.
 
-    Levanta PortalBlockedError / LoginTimeoutError / RuntimeError. No abre ni
-    cierra el navegador: el caller es dueño del ciclo de vida.
+    Si el portal pide 2FA (código OTP por correo), lo resuelve leyendo el código
+    del buzón configurado (MAIL_USER/MAIL_PASS). Levanta PortalBlockedError /
+    LoginTimeoutError / RuntimeError. No abre ni cierra el navegador: el caller
+    es dueño del ciclo de vida.
     """
     # `domcontentloaded`, no `load`: esperar todos los subrecursos incluye
     # terceros (New Relic, widget de WhatsApp) que a veces no cierran en 30s
@@ -200,6 +283,19 @@ def _login_en_page(page, usuario, clave, debug=False):
     # Línea base: lo que ya calzaba con el patrón ANTES de enviar el
     # formulario es decorado de la página, no un veredicto sobre el login.
     previos = page.evaluate(_JS_CANDIDATOS)
+
+    # Preparar la lectura del OTP ANTES de enviar: la "línea base" de correos de
+    # verificación ya existentes se toma ahora para, si el portal pide 2FA, poder
+    # distinguir el código NUEVO de esta sesión (incluso frente a otros logins en
+    # la misma corrida). Sin credenciales de correo seguimos igual: si no piden
+    # OTP, el login funciona; si lo piden, abajo se levanta un error claro.
+    reader, baseline = None, set()
+    if config.MAIL_USER and config.MAIL_PASS:
+        reader = MailReader(config.MAIL_USER, config.MAIL_PASS, config.MAIL_HOST)
+        try:
+            baseline = reader.baseline_uids()
+        except Exception as e:  # noqa: BLE001 — el OTP (si llega) lo reportará
+            log.warning("No se pudo leer la línea base de OTP del correo: %s", e)
 
     page.locator("#TxbUsuario").press_sequentially(usuario, delay=30)
     page.locator("#TxbClave").press_sequentially(clave, delay=30)
@@ -227,6 +323,18 @@ def _login_en_page(page, usuario, clave, debug=False):
         raise LoginTimeoutError(
             f"Timeout post-click; URL={page.url}, título={page.title()!r}."
         )
+
+    # 2FA: el portal intercaló el modal del código OTP. Se resuelve leyendo el
+    # código del correo y validándolo; el desenlace pasa a ser el de ESA validación.
+    if resultado.get("otp"):
+        if reader is None:
+            _dump_debug(page, "otp_sin_mail")
+            raise RuntimeError(
+                "El portal pidió un código OTP pero no hay MAIL_USER/MAIL_PASS "
+                "configurados para leerlo del correo. Configurá esas variables "
+                "(se reenvían como secrets en service.yaml)."
+            )
+        resultado = _resolver_otp(page, reader, baseline, previos)
 
     if not resultado.get("ok"):
         _dump_debug(page, "rechazo")
