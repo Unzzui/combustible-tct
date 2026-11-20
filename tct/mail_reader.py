@@ -25,9 +25,11 @@ login paralelo:
 from __future__ import annotations
 
 import email
+import email.utils
 import imaplib
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 
 IMAP_HOST = "imap.gmail.com"
@@ -87,30 +89,69 @@ class MailReader:
                 out.append(uid)
         return out
 
-    def baseline_uids(self) -> set[bytes]:
-        """UID de los correos OTP ya existentes (para ignorarlos luego)."""
-        M = self._conn()
+    def _fecha(self, M: imaplib.IMAP4_SSL, uid: bytes):
+        """Fecha (datetime UTC) del correo `uid`, o None si no se puede parsear."""
+        typ, data = M.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (DATE)])")
+        if not data or not data[0]:
+            return None
+        raw = data[0][1].decode("utf-8", "ignore")
+        val = raw.split(":", 1)[1].strip() if ":" in raw else raw.strip()
         try:
-            return set(self._otp_uids(M))
-        finally:
-            M.logout()
+            dt = email.utils.parsedate_to_datetime(val)
+        except Exception:
+            return None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def baseline_uids(self) -> set[bytes]:
+        """UID de los correos OTP ya existentes (para ignorarlos luego).
+
+        Reintenta ante hipos de IMAP: un baseline vacío por error haría que
+        wait_for_new_otp tratara un código VIEJO como nuevo y lo enviara."""
+        ultimo = None
+        for _ in range(3):
+            try:
+                M = self._conn()
+                try:
+                    return set(self._otp_uids(M))
+                finally:
+                    M.logout()
+            except Exception as e:  # noqa: BLE001
+                ultimo = e
+                time.sleep(2)
+        raise ultimo if ultimo else RuntimeError("baseline_uids falló")
 
     def wait_for_new_otp(
         self,
         baseline: set[bytes],
         timeout: int = 120,
         poll_interval: int = 5,
+        desde: "datetime | None" = None,
     ) -> str:
-        """Espera un correo OTP nuevo (UID no presente en `baseline`) y
-        devuelve el código. Lanza TimeoutError si no llega a tiempo."""
+        """Espera un correo OTP nuevo y devuelve el código. Lanza TimeoutError si
+        no llega a tiempo.
+
+        "Nuevo" = UID no presente en `baseline` Y, si se pasa `desde`, con fecha
+        posterior a `desde` (menos un margen por desfase de reloj). El filtro por
+        fecha es la salvaguarda clave: aunque la baseline falle/venga vacía, NUNCA
+        se envía un código viejo de una corrida anterior (que el portal rechaza y
+        gatilla el circuit breaker)."""
+        margen = timedelta(minutes=3)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             M = self._conn()
             try:
                 uids = self._otp_uids(M)
                 nuevos = [u for u in uids if u not in baseline]
-                if nuevos:
-                    uid = sorted(nuevos, key=lambda b: int(b))[-1]
+                # del más reciente al más viejo
+                for uid in sorted(nuevos, key=lambda b: int(b), reverse=True):
+                    if desde is not None:
+                        fecha = self._fecha(M, uid)
+                        if fecha is not None and fecha < desde - margen:
+                            continue   # correo previo al login: no es de esta sesión
                     code = self._extract_code(M, uid)
                     if code:
                         return code

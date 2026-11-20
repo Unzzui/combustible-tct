@@ -7,6 +7,7 @@ del sitio igual que un humano y nos entrega la sesión autenticada.
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -224,22 +225,27 @@ def _ingresar_codigo_otp(page, code):
     )
 
 
-def _resolver_otp(page, reader, baseline, previos):
+def _resolver_otp(page, reader, baseline, previos, desde=None):
     """El portal pidió 2FA: lee el código del correo, lo ingresa y lo valida.
 
-    Devuelve el dict de desenlace final (ticket OK o rechazo). Levanta
-    LoginTimeoutError si tras validar no aparece ni ticket ni mensaje."""
+    `desde` (datetime UTC) es el instante del envío del login: solo se aceptan
+    correos OTP posteriores, para no mandar nunca un código viejo (que el portal
+    rechaza y gatilla el circuit breaker). Devuelve el dict de desenlace final
+    (ticket OK o rechazo). Levanta LoginTimeoutError si tras validar no aparece
+    ni ticket ni mensaje."""
     log.info("Portal pidió código OTP; esperando el correo de verificación...")
     _dump_debug(page, "otp_pedido")
     try:
-        code = reader.wait_for_new_otp(baseline, timeout=90, poll_interval=5)
+        code = reader.wait_for_new_otp(baseline, timeout=90, poll_interval=5,
+                                       desde=desde)
     except TimeoutError:
         log.warning("OTP no llegó en 90s; solicito reenvío y espero más.")
         try:
             page.eval_on_selector("#BtnReenviarOtp", "el => el.click()")
         except Exception:
             pass
-        code = reader.wait_for_new_otp(baseline, timeout=120, poll_interval=5)
+        code = reader.wait_for_new_otp(baseline, timeout=120, poll_interval=5,
+                                       desde=desde)
     log.info("OTP recibido (%d dígitos); validando.", len(code))
     _ingresar_codigo_otp(page, code)
     page.eval_on_selector("#BtnValidarOtp", "el => el.click()")
@@ -300,6 +306,9 @@ def _login_en_page(page, usuario, clave, debug=False):
     page.locator("#TxbUsuario").press_sequentially(usuario, delay=30)
     page.locator("#TxbClave").press_sequentially(clave, delay=30)
     page.locator("#TxbClave").blur()
+    # Marca temporal del envío: el OTP de ESTA sesión llega después de este
+    # instante. wait_for_new_otp descarta correos anteriores (código viejo).
+    otp_desde = datetime.now(timezone.utc)
     page.click("#BtnIngresar")
 
     # Race entre "ticket rellenado" y "mensaje de error nuevo". El primero
@@ -334,7 +343,7 @@ def _login_en_page(page, usuario, clave, debug=False):
                 "configurados para leerlo del correo. Configurá esas variables "
                 "(se reenvían como secrets en service.yaml)."
             )
-        resultado = _resolver_otp(page, reader, baseline, previos)
+        resultado = _resolver_otp(page, reader, baseline, previos, desde=otp_desde)
 
     if not resultado.get("ok"):
         _dump_debug(page, "rechazo")
